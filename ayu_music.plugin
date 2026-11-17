@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ayu Music 1.2: native music library for AyuGram / exteraGram.
+"""Ayu Music 1.3: native music library for AyuGram / exteraGram.
 
 Single-file source plugin. No external servers, tokens, packages or message sends.
 Music provider and document-to-MessageObject conversion follow Telegram Android's
@@ -28,7 +28,7 @@ __id__ = "ayu_music"
 __name__ = "Ayu Music"
 __description__ = "Волны по треку, плейлисту и любимому, локальная медиатека, импорт из чатов, кэш и оформление своими цветами. Штатный плеер Telegram."
 __author__ = "@Demon_In_Moscow"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -66,6 +66,22 @@ EditorListener = jclass("android.widget.TextView$OnEditorActionListener")
 BUTTON_ID = 197031601
 MATCH = -1
 WRAP = -2
+
+MUSIC_ICONS = {
+    "▶":("ic_action_play","ic_play"),
+    "Ⅱ":("ic_action_pause","ic_pause"),
+    "›":("ic_action_next","msg_arrowright"),
+    "♡":("media_like","msg_unfave"),
+    "♥":("media_like_active","mini_like_filled","msg_fave"),
+    "⋮":("media_more","mini_more_dots"),
+    "wave":("search_music_filled","msg_filled_data_music"),
+    "shuffle":("player_new_shuffle","msg_reset"),
+    "download":("msg_download",),
+    "add":("msg_add",),
+    "music":("files_music","msg_filled_data_music"),
+    "settings":("msg_settings",),
+    "retry":("msg_reset","player_new_shuffle"),
+}
 
 
 def dp(value):
@@ -1173,11 +1189,11 @@ class MusicAccount:
 
     def play_wave_index(self, index):
         if not self.wave_active or not self.wave_queue or not self.valid():
-            return
+            return False
         index = max(0, min(index, len(self.wave_queue)-1))
-        self.wave_position = index
         track = self.wave_queue[index]
-        self.install_playlist(self.wave_queue, track)
+        if not self.install_playlist(self.wave_queue, track):return False
+        self.wave_position = index
         self.local_queue=[]
         if self.wave_position > 25:
             self.wave_queue = self.wave_queue[self.wave_position-15:]
@@ -1186,15 +1202,16 @@ class MusicAccount:
         if len(self.wave_queue) - self.wave_position - 1 < 8:
             self.attempts = 0
             self.fill_wave()
+        return True
 
     def advance(self, previous=False, by_stop=False, expected_mid=None):
         if self.transitioning or not self.wave_active:
-            return
+            return False
         current = MediaController.getInstance().getPlayingMessageObject()
         if not self.is_wave_message(current):
-            return
+            return False
         if expected_mid is not None and int(current.getId())!=expected_mid:
-            return
+            return False
         self.transitioning = True
         try:
             self.observe(current)
@@ -1205,22 +1222,23 @@ class MusicAccount:
             repeat_one = by_stop and int(SharedConfig.repeatMode) == 2
             if repeat_one or (previous and int(current.audioProgressSec) > 10):
                 MediaController.getInstance().seekToProgress(current, 0.0)
-                MediaController.getInstance().playMessage(current)
+                started=MediaController.getInstance().playMessage(current)
                 self.session = None
-                return
+                return bool(started)
             index = max(0,pos-1) if previous else pos+1
             if not previous and SharedConfig.shuffleMusic and pos+1 < len(self.wave_queue):
                 index = random.randrange(pos+1,len(self.wave_queue))
             if index >= len(self.wave_queue):
                 self.wave_position = pos
-                self.wave_status = "Ищем следующие песни…"
+                if not self.failures:self.wave_status = "Ищем следующие песни…"
                 self.attempts = 0
                 self.waiting_next = True
                 if not by_stop:
                     MediaController.getInstance().pauseMessage(current)
                 self.fill_wave()
+                return True
             else:
-                self.play_wave_index(index)
+                return self.play_wave_index(index)
         finally:
             self.transitioning = False
 
@@ -1237,6 +1255,10 @@ class MusicAccount:
             ok = media.setPlaylist(playlist, target["message"], 0, False, None)
         finally:
             self.installing = False
+        if not ok or not same_message(media.getPlayingMessageObject(),target["message"]):
+            self.wave_status="Плеер не смог запустить трек"
+            self.plugin.update_screens(self)
+            return False
         # Keep the explicit order for ordinary local playlists too. setPlaylist
         # sorts synthetic IDs; reorder the existing list without restarting audio.
         if not bool(SharedConfig.shuffleMusic):
@@ -1611,7 +1633,7 @@ class WaveSkipHook(MethodHook):
                     # We're already in MediaController's own end callback.
                     # Complete the fallback on that same thread, and suppress
                     # native playback only after our transition succeeds.
-                    owner.advance(False,True,expected_mid)
+                    if not owner.advance(False,True,expected_mid):return
                     owner.python_transitions+=1
                     owner.last_transition="обработчик волны без отложенного запуска"
                     param.setResult(None)
@@ -3005,6 +3027,8 @@ class MusicScreen(Base):
         self.appearance_serial=0
         self.colors_expanded=False
         self.color_editors=[]
+        self.icon_views={}
+        self.icon_resources={}
 
     @joverride("createView", ["android.content.Context"])
     def create_view(self, context):
@@ -3057,6 +3081,10 @@ class MusicScreen(Base):
             self.root.removeCallbacks(self.ticker)
         if self in self.plugin.screens:
             self.plugin.screens.remove(self)
+        for state in self.icon_views.values():state["view"].setOnClickListener(None)
+        self.icon_views.clear()
+        self.content_listeners.clear()
+        self.listeners.clear()
 
     def click(self, view, callback, content=False):
         def safe_click(v):
@@ -3077,7 +3105,7 @@ class MusicScreen(Base):
         label.setTextSize(float(size))
         label.setTextColor(readable_ink(self.background if on is None else on,self.muted if secondary else self.foreground,secondary))
         label.setGravity(Gravity.CENTER_VERTICAL)
-        label.setIncludeFontPadding(False)
+        label.setIncludeFontPadding(True)
         label.setTypeface(self.fonts.get("medium" if bold else "body",Typeface.DEFAULT))
         if bold and not self.fonts:label.setTypeface(Typeface.DEFAULT,Typeface.BOLD)
         return label
@@ -3132,7 +3160,8 @@ class MusicScreen(Base):
         view.setPadding(dp(14),dp(12),dp(14),dp(12))
         view.setMinHeight(dp(50))
         view.setTextColor(contrast_ink(self.design["buttons"]))
-        view.setBackground(self.rounded(self.design["buttons"],18))
+        view.setBackground(self.click_background(self.design["buttons"],18))
+        self.decorate_action(view,text,contrast_ink(self.design["buttons"]))
         self.click(view,callback,True)
         params=LinearLayout.LayoutParams(MATCH,WRAP)
         params.topMargin=dp(8);params.bottomMargin=dp(12)
@@ -3144,6 +3173,102 @@ class MusicScreen(Base):
         drawable.setColor(fill)
         drawable.setCornerRadius(float(dp(radius)))
         return drawable
+
+    def click_background(self,fill,radius=18):
+        try:
+            pressed=blend_color(self.surface if fill==0 else fill,self.accent,0.16)
+            return Theme.createSimpleSelectorRoundRectDrawable(dp(radius),int(fill),int(pressed))
+        except Exception:return self.rounded(fill,radius)
+
+    def icon_resource(self,symbol):
+        if symbol not in self.icon_resources:self.icon_resources[symbol]=resource(self.context,*MUSIC_ICONS.get(symbol,()))
+        return self.icon_resources[symbol]
+
+    def icon_button(self,symbol,callback,width=44,size=22,content=False):
+        view=FrameLayout(self.context)
+        view.setMinimumHeight(dp(48))
+        view.setFocusable(True)
+        view.setBackground(self.click_background(0,22))
+        view.setLayoutParams(LinearLayout.LayoutParams(dp(width),dp(48)))
+        picture=jclass("android.widget.ImageView")(self.context)
+        picture.setImportantForAccessibility(2)
+        view.addView(picture,FrameLayout.LayoutParams(dp(size),dp(size),Gravity.CENTER))
+        fallback=self.label("",size)
+        fallback.setGravity(Gravity.CENTER)
+        fallback.setTypeface(Typeface.DEFAULT)
+        fallback.setImportantForAccessibility(2)
+        view.addView(fallback,FrameLayout.LayoutParams(MATCH,MATCH))
+        self.icon_views[id(view)]={"view":view,"picture":picture,"fallback":fallback,"symbol":None,"content":content}
+        self.click(view,callback,content)
+        self.set_icon(view,symbol)
+        self.tint_icon(view,self.foreground)
+        return view
+
+    def icon_symbol(self,view):
+        return self.icon_views.get(id(view),{}).get("symbol")
+
+    def set_icon(self,view,symbol):
+        state=self.icon_views.get(id(view))
+        if state is None:return
+        if state["symbol"]==symbol:return
+        state["symbol"]=symbol
+        drawable=self.icon_resource(symbol)
+        try:
+            if not drawable:raise ValueError("Icon unavailable")
+            state["picture"].setImageResource(drawable)
+            state["picture"].setVisibility(View.VISIBLE)
+            state["fallback"].setVisibility(View.GONE)
+        except Exception:
+            state["picture"].setVisibility(View.GONE)
+            state["fallback"].setText({"retry":"↻","shuffle":"↻","wave":"♫"}.get(symbol,symbol))
+            state["fallback"].setVisibility(View.VISIBLE)
+        view.setContentDescription({"▶":"Воспроизвести","Ⅱ":"Пауза","›":"Следующий трек","♡":"В любимое плагина","♥":"Убрать из любимого плагина","⋮":"Действия с песней","retry":"Повторить подбор волны"}.get(symbol,symbol))
+
+    def tint_icon(self,view,tint):
+        state=self.icon_views.get(id(view))
+        if state is None:return
+        if state.get("tint")==int(tint):return
+        state["tint"]=int(tint)
+        state["picture"].setColorFilter(int(tint))
+        state["fallback"].setTextColor(int(tint))
+
+    def decorate_action(self,view,text,tint=None):
+        icon=None
+        for prefix,key in (("〰","wave"),("↓","download"),("＋","add"),("▶","▶"),("↻","shuffle")):
+            if str(text).startswith(prefix):icon=key;text=str(text)[len(prefix):].strip();break
+        view.setText(str(text))
+        if icon:
+            try:
+                drawable=self.context.getResources().getDrawable(self.icon_resource(icon)).mutate()
+                drawable.setBounds(0,0,dp(20),dp(20))
+                drawable.setColorFilter(int(self.accent if tint is None else tint),jclass("android.graphics.PorterDuff$Mode").SRC_IN)
+                view.setCompoundDrawables(drawable,None,None,None)
+                view.setCompoundDrawablePadding(dp(10))
+            except Exception:pass
+
+    def layout_footer(self,editing):
+        def line_height(view):
+            try:
+                metrics=view.getPaint().getFontMetricsInt()
+                return int(metrics.bottom)-int(metrics.top)
+            except Exception:return dp(20)
+        nav_height=max(dp(68),dp(38)+max(line_height(text) for tab,picture,text in self.nav_items.values()))
+        self.nav_params.height=nav_height
+        self.navigation.setLayoutParams(self.nav_params)
+        for tab,picture,text in self.nav_items.values():
+            params=tab.getLayoutParams();params.height=nav_height-dp(10);tab.setLayoutParams(params)
+        self.player_params.height=max(dp(72),dp(16)+line_height(self.player_title)+line_height(self.player_subtitle))
+        self.player_params.bottomMargin=nav_height+dp(20)
+        self.player.setLayoutParams(self.player_params)
+        width=int(self.root.getWidth()) or int(self.context.getResources().getDisplayMetrics().widthPixels)
+        self.player_heart.setVisibility(View.GONE if width<dp(360) else View.VISIBLE)
+        edit_height=max(dp(50),dp(20)+max(line_height(self.edit_cancel),line_height(self.edit_accept)))
+        self.edit_params.height=edit_height+dp(16)
+        self.edit_actions.setLayoutParams(self.edit_params)
+        for button in (self.edit_cancel,self.edit_accept):
+            params=button.getLayoutParams();params.height=edit_height;button.setLayoutParams(params)
+        self.body_params.bottomMargin=self.edit_params.height+dp(4) if editing else self.player_params.height+self.player_params.bottomMargin+dp(8)
+        self.body_column.setLayoutParams(self.body_params)
 
     def button(self,text,callback,width=48,content=False):
         view = self.label(text,20,on=self.surface)
@@ -3233,8 +3358,12 @@ class MusicScreen(Base):
         player.setBackground(self.rounded(self.surface,23))
         player.setElevation(float(dp(6)))
         self.player = player
+        self.player_more=self.icon_button("⋮",self.playing_actions,44,20)
+        self.player_more.setContentDescription("Действия с текущей песней")
+        player.addView(self.player_more)
         info = LinearLayout(context)
         info.setOrientation(1)
+        info.setPadding(dp(4),0,dp(6),0)
         self.player_title = self.label("Выбери трек",15,bold=True)
         self.player_subtitle = self.label("Включи волну или найди песню",12,True)
         for label in (self.player_title,self.player_subtitle):
@@ -3243,19 +3372,16 @@ class MusicScreen(Base):
             info.addView(label)
         self.click(info,self.show_player)
         player.addView(info,LinearLayout.LayoutParams(0,WRAP,1.0))
-        self.player_heart = self.button("♡",self.like_playing,42)
-        self.play_button = self.button("▶",self.toggle_play,44)
+        self.player_heart = self.icon_button("♡",self.like_playing,44,21)
+        self.play_button = self.icon_button("▶",self.toggle_play,48,24)
         player.addView(self.player_heart)
         player.addView(self.play_button)
-        self.player_next = self.button("›",self.next_track,42)
+        self.player_next = self.icon_button("›",self.next_track,44,23)
         player.addView(self.player_next)
-        self.player_more=self.button("⋮",self.playing_actions,40)
-        self.player_more.setTypeface(Typeface.DEFAULT)
-        self.player_more.setContentDescription("Действия с текущей песней")
-        player.addView(self.player_more)
-        player_params = FrameLayout.LayoutParams(MATCH,dp(66),Gravity.BOTTOM)
-        player_params.leftMargin = player_params.rightMargin = dp(16)
+        player_params = FrameLayout.LayoutParams(MATCH,dp(72),Gravity.BOTTOM)
+        player_params.leftMargin = player_params.rightMargin = dp(12)
         player_params.bottomMargin = dp(92)
+        self.player_params=player_params
         root.addView(player,player_params)
 
         navigation = LinearLayout(context)
@@ -3273,6 +3399,8 @@ class MusicScreen(Base):
             picture.setImageResource(resource(context,icon))
             tab.addView(picture,LinearLayout.LayoutParams(dp(24),dp(24)))
             text = self.label(title,11)
+            text.setSingleLine(True)
+            text.setIncludeFontPadding(False)
             text.setGravity(Gravity.CENTER)
             tab.addView(text,LinearLayout.LayoutParams(MATCH,dp(20)))
             tab.setContentDescription(title)
@@ -3284,6 +3412,7 @@ class MusicScreen(Base):
         nav_params = FrameLayout.LayoutParams(MATCH,dp(68),Gravity.BOTTOM)
         nav_params.leftMargin = nav_params.rightMargin = dp(28)
         nav_params.bottomMargin = dp(12)
+        self.nav_params=nav_params
         root.addView(navigation,nav_params)
         self.edit_actions = LinearLayout(context)
         self.edit_actions.setPadding(dp(16),dp(8),dp(16),dp(8))
@@ -3293,6 +3422,7 @@ class MusicScreen(Base):
             view.setTextSize(14.0)
             self.edit_actions.addView(view,LinearLayout.LayoutParams(0,dp(50),1.0))
         edit_params = FrameLayout.LayoutParams(MATCH,dp(72),Gravity.BOTTOM)
+        self.edit_params=edit_params
         root.addView(self.edit_actions,edit_params)
         self.ticker = R(self.update_player)
         self.java.setFragmentView(root)
@@ -3325,6 +3455,9 @@ class MusicScreen(Base):
         if self.closed or self.root is None or not hasattr(self,"content"):
             return
         self.apply_design()
+        for state in self.icon_views.values():
+            if state["content"]:state["view"].setOnClickListener(None)
+        self.icon_views={key:state for key,state in self.icon_views.items() if not state["content"]}
         self.content.removeAllViews()
         self.content_listeners.clear()
         self.rows.clear()
@@ -3333,14 +3466,13 @@ class MusicScreen(Base):
         self.wave_label = None
         self.wave_symbol = None
         self.shake_button = None
+        self.shake_label = None
         self.search_bar.setVisibility(View.VISIBLE if self.page=="search" else View.GONE)
         home = self.page=="home"
         editing=self.page in ("wave_settings","artists","appearance")
         self.edit_actions.setVisibility(View.VISIBLE if editing else View.GONE)
         self.player.setVisibility(View.GONE if editing else View.VISIBLE)
         self.navigation.setVisibility(View.GONE if editing else View.VISIBLE)
-        self.body_params.bottomMargin=dp(76 if editing else 166)
-        self.body_column.setLayoutParams(self.body_params)
         self.editor_host.setVisibility(View.VISIBLE if self.page=="artists" else View.GONE)
         self.scroll.setVisibility(View.GONE if self.page=="artists" else View.VISIBLE)
         self.appearance_item.setVisibility(View.GONE if editing else View.VISIBLE)
@@ -3376,8 +3508,11 @@ class MusicScreen(Base):
         self.player_title.setTypeface(self.fonts["medium"])
         self.player_subtitle.setTypeface(self.fonts["body"])
         for child in (self.player_heart,self.play_button,self.player_next,self.player_more):
-            child.setBackgroundColor(0)
-            child.setTextColor(ink)
+            child.setBackground(self.click_background(0,24))
+            self.tint_icon(child,ink)
+        play_fill=blend_color(player_fill,self.accent,0.20)
+        self.play_button.setBackground(self.click_background(play_fill,24))
+        self.tint_icon(self.play_button,readable_ink(play_fill,self.foreground))
         for key,(tab,picture,text) in self.nav_items.items():
             selected_fill=blend_color(nav_fill,self.accent,0.15)
             tint=readable_ink(selected_fill if key==current_tab else nav_fill,self.accent if key==current_tab else self.muted,key!=current_tab)
@@ -3385,6 +3520,9 @@ class MusicScreen(Base):
             picture.setColorFilter(tint)
             text.setTextColor(tint)
             text.setTypeface(self.fonts["medium"])
+            tab.setSelected(key==current_tab)
+        self.layout_footer(editing)
+        self.content.setGravity(Gravity.CENTER_VERTICAL if home else Gravity.TOP)
         self.content.setPadding(dp(18),dp(8),dp(18),dp(18))
         title = {"home":"Ayu Music","favorites":"Медиатека","search":"Поиск музыки","playlist":"Плейлист","wave_queue":"Дальше в волне","wave_settings":"Твоя волна","artists":"Любимые исполнители","appearance":"Облик"}[self.page]
         self.java.getActionBar().setTitle(title)
@@ -3415,38 +3553,44 @@ class MusicScreen(Base):
         stage.setGravity(Gravity.CENTER)
         stage.setMinimumHeight(dp(310))
         stage.setPadding(dp(10),dp(20),dp(10),dp(20))
-        title = self.heading(self.owner.wave_heading(),42)
+        title = self.heading(self.owner.wave_heading(),34)
         title.setTextColor(-1)
         title.setGravity(Gravity.CENTER)
-        title.setSingleLine(True)
-        try:title.setAutoSizeTextTypeUniformWithConfiguration(28,46,1,2)
-        except Exception:pass
-        stage.addView(title,LinearLayout.LayoutParams(MATCH,dp(66)))
+        title.setMaxLines(2)
+        title.setEllipsize(TruncateAt.END)
+        stage.addView(title,LinearLayout.LayoutParams(MATCH,WRAP))
         caption = self.label(self.owner.wave_caption(),14)
         caption.setTextColor(-1)
         caption.setGravity(Gravity.CENTER)
         caption.setMaxLines(2)
         caption.setEllipsize(TruncateAt.END)
-        stage.addView(caption,LinearLayout.LayoutParams(MATCH,dp(52 if custom else 32)))
-        symbol = self.label("▶",44,bold=True)
-        symbol.setGravity(Gravity.CENTER)
-        symbol.setTextColor(contrast_ink(self.design["wave_button"]))
-        symbol.setIncludeFontPadding(False)
-        symbol.setBackground(self.rounded(self.design["wave_button"],52))
+        caption.setPadding(dp(8),dp(10),dp(8),dp(4))
+        stage.addView(caption,LinearLayout.LayoutParams(MATCH,WRAP))
+        symbol = self.icon_button("▶",self.wave_click,96,38,True)
+        self.tint_icon(symbol,contrast_ink(self.design["wave_button"]))
+        symbol.setBackground(self.click_background(self.design["wave_button"],48))
         symbol.setContentDescription("Включить или приостановить волну")
-        self.click(symbol,self.wave_click,True)
-        play_params = LinearLayout.LayoutParams(dp(88 if custom else 104),dp(88 if custom else 104))
-        play_params.topMargin = dp(16 if custom else 24)
-        play_params.bottomMargin = dp(16 if custom else 20)
+        play_params = LinearLayout.LayoutParams(dp(96),dp(96))
+        play_params.gravity=Gravity.CENTER_HORIZONTAL
+        play_params.topMargin = dp(22)
+        play_params.bottomMargin = dp(22)
         stage.addView(symbol,play_params)
         self.wave_symbol = symbol
-        shake = self.label("↻  Встряхнуть волну",14,bold=True)
+        shake = LinearLayout(self.context)
         shake.setGravity(Gravity.CENTER)
         shake.setPadding(dp(18),0,dp(18),0)
-        shake.setTextColor(-1)
-        shake.setBackground(self.rounded(argb(0x66000000),24))
+        shake.setBackground(self.click_background(argb(0x66000000),24))
+        shuffle=jclass("android.widget.ImageView")(self.context)
+        shuffle.setImageResource(self.icon_resource("shuffle"));shuffle.setColorFilter(-1)
+        shuffle.setImportantForAccessibility(2)
+        shake.addView(shuffle,LinearLayout.LayoutParams(dp(20),dp(20)))
+        self.shake_label=self.label("Встряхнуть волну",14,bold=True)
+        self.shake_label.setTextColor(-1)
+        self.shake_label.setPadding(dp(10),0,0,0)
+        shake.addView(self.shake_label,LinearLayout.LayoutParams(WRAP,WRAP))
         self.click(shake,self.shake_wave,True)
-        stage.addView(shake,LinearLayout.LayoutParams(WRAP,dp(48)))
+        shake_params=LinearLayout.LayoutParams(WRAP,dp(48));shake_params.gravity=Gravity.CENTER_HORIZONTAL
+        stage.addView(shake,shake_params)
         self.shake_button = shake
         settings = self.label("Изменить направление" if seed else "Обновить по коллекции" if grouped else "Настроить волну",13)
         settings.setTextColor(-1)
@@ -3465,7 +3609,7 @@ class MusicScreen(Base):
         else:
             self.click(settings,lambda:self.configure_wave(False),True)
             stage.addView(settings,LinearLayout.LayoutParams(MATCH,dp(48)))
-        self.content.addView(stage,LinearLayout.LayoutParams(MATCH,0,1.0))
+        self.content.addView(stage,LinearLayout.LayoutParams(MATCH,WRAP))
         self.wave_label = self.padded_text(self.owner.wave_status,12)
         self.wave_label.setTextColor(-1)
         self.wave_label.setGravity(Gravity.CENTER)
@@ -3504,11 +3648,12 @@ class MusicScreen(Base):
 
     def action_row(self,text,callback):
         view = self.label(text,15,bold=True,on=self.surface)
-        view.setTextColor(self.accent)
+        view.setTextColor(readable_ink(self.surface,self.accent))
+        self.decorate_action(view,text,readable_ink(self.surface,self.accent))
         view.setMinHeight(dp(48))
         view.setGravity(Gravity.CENTER_VERTICAL)
         view.setPadding(dp(14),dp(8),dp(14),dp(8))
-        view.setBackground(self.rounded(self.surface,16))
+        view.setBackground(self.click_background(self.surface,16))
         self.click(view,callback,True)
         params=LinearLayout.LayoutParams(MATCH,WRAP)
         params.topMargin=dp(3);params.bottomMargin=dp(5)
@@ -3567,11 +3712,13 @@ class MusicScreen(Base):
         row.setPadding(dp(10),dp(10),dp(10),dp(10))
         row.setBackground(self.rounded(self.surface,22))
         tint=argb((0xff9788d8,0xff7ba7bb,0xffb285a3,0xff86ac91)[sum(ord(c) for c in str(pid))%4])
-        cover=self.heading("♫",27)
-        cover.setGravity(Gravity.CENTER)
-        cover.setTextColor(contrast_ink(tint))
+        cover=FrameLayout(self.context)
         cover.setBackground(self.rounded(tint,17))
         cover.setImportantForAccessibility(2)
+        cover_icon=jclass("android.widget.ImageView")(self.context)
+        cover_icon.setImageResource(resource(self.context,"player_new_order","msg_saved"))
+        cover_icon.setColorFilter(contrast_ink(tint))
+        cover.addView(cover_icon,FrameLayout.LayoutParams(dp(28),dp(28),Gravity.CENTER))
         row.addView(cover,LinearLayout.LayoutParams(dp(56),dp(56)))
         info=LinearLayout(self.context)
         info.setOrientation(1)
@@ -3728,8 +3875,9 @@ class MusicScreen(Base):
     def add_track_row(self,track,queue,wave=False,collection_ids=None):
         row=LinearLayout(self.context)
         row.setGravity(Gravity.CENTER_VERTICAL)
-        row.setPadding(dp(8),dp(8),dp(4),dp(8))
-        row.setBackground(self.rounded(self.surface,19))
+        row.setPadding(dp(8),dp(8),dp(2),dp(8))
+        row.setMinimumHeight(dp(74))
+        row.setBackground(self.click_background(self.surface,18))
         def play():
             if self.toggle_selected_track(track):return
             if wave and self.owner.wave_active:
@@ -3737,15 +3885,13 @@ class MusicScreen(Base):
                 self.owner.play_wave_index(index)
             elif collection_ids is not None:self.play_collection(collection_ids,track["id"])
             else:self.play_saved(queue,track)
-        play_button=self.button("▶",play,44,True)
-        play_button.setTextSize(19.0)
-        play_button.setTypeface(Typeface.DEFAULT)
-        play_button.setTextColor(readable_ink(self.raised,self.accent))
-        play_button.setBackground(self.rounded(self.raised,14))
+        play_button=self.icon_button("▶",play,44,22,True)
+        self.tint_icon(play_button,readable_ink(self.raised,self.accent))
+        play_button.setBackground(self.click_background(self.raised,22))
         row.addView(play_button)
         info=LinearLayout(self.context)
         info.setOrientation(1)
-        info.setPadding(dp(12),dp(3),dp(2),dp(3))
+        info.setPadding(dp(10),dp(2),dp(2),dp(2))
         title=self.label(track["title"],15,bold=True,on=self.surface)
         subtitle=self.label(track["artist"]+" · "+duration_text(track["duration"]),12,True,on=self.surface)
         self.cache_labels[track["id"]]=(track,subtitle)
@@ -3754,13 +3900,11 @@ class MusicScreen(Base):
             label.setEllipsize(TruncateAt.END)
             info.addView(label)
         row.addView(info,LinearLayout.LayoutParams(0,WRAP,1.0))
-        heart=self.button("♥" if track["id"] in self.owner.collection.data["liked"] else "♡",lambda:self.like_track(track),38,True)
-        heart.setTextColor(self.accent)
-        heart.setBackgroundColor(0)
-        heart.setTypeface(Typeface.DEFAULT)
+        heart=self.icon_button("♥" if track["id"] in self.owner.collection.data["liked"] else "♡",lambda:self.like_track(track),44,21,True)
+        self.tint_icon(heart,readable_ink(self.surface,self.accent))
         row.addView(heart)
-        more=self.button("⋮",lambda:self.track_actions(track),32,True)
-        more.setTypeface(Typeface.DEFAULT);more.setBackgroundColor(0)
+        more=self.icon_button("⋮",lambda:self.track_actions(track),44,20,True)
+        self.tint_icon(more,readable_ink(self.surface,self.muted,True))
         row.addView(more)
         self.click(info,play,True)
         self.click(row,play,True)
@@ -3785,12 +3929,6 @@ class MusicScreen(Base):
         self.owner.play(queue,target)
 
     def like_track(self,track):
-        if track.get("message") is None:
-            # A saved record already contains all metadata needed to unlike it.
-            if track["id"] in self.owner.collection.data["liked"]:
-                self.owner.collection.like(track["id"])
-                self.owner.changed()
-            return
         self.owner.toggle_like(track)
 
     def track_actions(self,track,allow_playlist_remove=True):
@@ -3896,10 +4034,7 @@ class MusicScreen(Base):
         def chosen(dialog,index):
             if index==len(ids):self.create_playlist(track)
             else:
-                if track.get("message") is not None:self.owner.add_to_playlist(ids[index],track)
-                else:
-                    self.owner.collection.add(ids[index],track["id"])
-                    self.owner.changed()
+                self.owner.add_to_playlist(ids[index],track)
                 self.notify("Добавлено в плейлист плагина")
         AlertDialogBuilder(self.context).set_title("Добавить в плейлист").set_items(labels,chosen).show()
 
@@ -3922,7 +4057,7 @@ class MusicScreen(Base):
         def create(name):
             pid=self.owner.collection.playlist(name)
             if track:
-                if track.get("message") is not None:self.owner.keep(track)
+                self.owner.keep(track)
                 self.owner.collection.add(pid,track["id"])
             self.owner.changed()
             self.notify("Плейлист создан")
@@ -4168,6 +4303,9 @@ class MusicScreen(Base):
     def wave_click(self):
         if self.owner.seed_starting:return
         if self.owner.wave_active:
+            if self.owner.failures or self.owner.waiting_next:
+                self.retry_wave()
+                return
             current=MediaController.getInstance().getPlayingMessageObject()
             if self.owner.is_wave_message(current):self.toggle_play()
             elif not self.owner.wave_busy:self.retry_wave()
@@ -4182,9 +4320,13 @@ class MusicScreen(Base):
         else:self.owner.start_wave()
 
     def retry_wave(self):
+        if self.owner.seed_starting or self.owner.wave_busy:return
         self.owner.attempts,self.owner.failures=0,0
         if not self.owner.wave_active:self.owner.restart_wave()
-        else:self.owner.fill_wave()
+        else:
+            self.owner.wave_status="Продолжаем подбор…"
+            self.owner.fill_wave()
+            self.plugin.update_screens(self.owner)
 
     def shake_wave(self):
         if not self.owner.wave_sources():
@@ -4247,31 +4389,36 @@ class MusicScreen(Base):
         if not valid:
             self.player_title.setText("Выбери трек")
             self.player_subtitle.setText("Включи волну или найди песню")
-            self.play_button.setText("▶")
+            self.set_icon(self.play_button,"▶")
         else:
             self.player_title.setText(str(current.getMusicTitle()))
             self.player_subtitle.setText(str(current.getMusicAuthor())+" · "+("Загрузка…" if media.isDownloadingCurrentMessage() else duration_text(current.audioProgressSec)))
-            self.play_button.setText("▶" if media.isMessagePaused() else "Ⅱ")
+            self.set_icon(self.play_button,"▶" if media.isMessagePaused() else "Ⅱ")
         liked=self.owner.collection.data["liked"]
         current_id=str(current.getDocument().id) if valid and current.getDocument() is not None else ""
-        self.player_heart.setText("♥" if current_id in liked else "♡")
-        self.player_heart.setTextColor(readable_ink(self.player_fill,self.accent if own else self.muted,not bool(own)))
+        self.set_icon(self.player_heart,"♥" if current_id in liked else "♡")
+        self.tint_icon(self.player_heart,readable_ink(self.player_fill,self.accent if current_id in liked else self.muted,current_id not in liked))
         self.player_heart.setEnabled(valid)
         self.player_more.setEnabled(valid)
         self.player_more.setAlpha(1.0 if valid else 0.4)
         if self.wave_symbol is not None:
-            self.wave_symbol.setText("Ⅱ" if valid and self.owner.wave_active and self.owner.is_wave_message(current) and not media.isMessagePaused() else "▶")
+            retry=bool(self.owner.wave_active and (self.owner.failures or self.owner.waiting_next))
+            self.set_icon(self.wave_symbol,"retry" if retry else "Ⅱ" if valid and self.owner.wave_active and self.owner.is_wave_message(current) and not media.isMessagePaused() else "▶")
+            self.wave_symbol.setEnabled(not self.owner.seed_starting)
+            self.wave_symbol.setAlpha(0.6 if self.owner.seed_starting else 1.0)
         for track,play,heart in self.rows:
             active=bool(valid and str(current.getDocument().id)==str(track["id"]))
-            play.setText("Ⅱ" if active and not media.isMessagePaused() else "▶")
-            heart.setText("♥" if track["id"] in liked else "♡")
+            self.set_icon(play,"Ⅱ" if active and not media.isMessagePaused() else "▶")
+            self.set_icon(heart,"♥" if track["id"] in liked else "♡")
+            fill=self.design["selected"] if active else self.surface
+            self.tint_icon(heart,readable_ink(fill,self.accent if track["id"] in liked else self.muted,track["id"] not in liked))
             if self.row_states.get(track["id"])!=active:
                 self.row_states[track["id"]]=active
                 shell=self.row_shells.get(track["id"])
                 if shell:
                     row,title=shell
                     fill=self.design["selected"] if active else self.surface
-                    row.setBackground(self.rounded(fill,19))
+                    row.setBackground(self.click_background(fill,18))
                     title.setTextColor(readable_ink(fill,self.accent if active else self.foreground))
                     subtitle=self.cache_labels.get(track["id"])
                     if subtitle:subtitle[1].setTextColor(readable_ink(fill,self.muted,True))
@@ -4283,7 +4430,7 @@ class MusicScreen(Base):
         if self.wave_label is not None:self.wave_label.setText(self.owner.wave_status)
         if self.shake_button is not None:
             busy=self.owner.wave_rebuilding or self.owner.seed_starting
-            self.shake_button.setText("Готовим исходную песню…" if self.owner.seed_starting else "Подбираем новые песни…" if self.owner.wave_rebuilding else "↻  Встряхнуть волну")
+            self.shake_label.setText("Готовим исходную песню…" if self.owner.seed_starting else "Подбираем новые песни…" if self.owner.wave_rebuilding else "Встряхнуть волну")
             self.shake_button.setEnabled(not busy)
             self.shake_button.setAlpha(0.65 if busy else 1.0)
         if self.backdrop:self.backdrop.update(current)
@@ -4433,7 +4580,7 @@ class AyuMusicPlugin(BasePlugin):
     def show_diagnostics(self):
         context=self.current_context()
         if context is None:return
-        text="Ayu Music 1.2.0\nАвтор: @Demon_In_Moscow\nAyuGram 20261104 / exteraGram 13.1.1\n"
+        text="Ayu Music 1.3.0\nАвтор: @Demon_In_Moscow\nAyuGram 20261104 / exteraGram 13.1.1\n"
         text+="Кнопок: %d · обработчик волны: %s\n"%(len(self.header_buttons),"готов" if self.wave_available else "недоступен")
         owner=self.current_owner()
         if owner:
@@ -4571,7 +4718,7 @@ class AyuMusicPlugin(BasePlugin):
             self.show_diagnostics()
 
     def create_settings(self):
-        return [Header(text="Ayu Music · 1.2.0"),
+        return [Header(text="Ayu Music · 1.3.0"),
             Text(text="Открыть музыку",icon="msg_filled_data_music",on_click=lambda view:self.open_music()),
             Text(text="Облик, цвета и шрифты",subtext="Общая палитра, цвета блоков и жанров, 13 начертаний",icon="msg_theme",on_click=lambda view:self.open_music(page="appearance")),
             Text(text="Диагностика",icon="msg_info",on_click=lambda view:self.show_diagnostics()),
