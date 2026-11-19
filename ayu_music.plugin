@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ayu Music 1.3: native music library for AyuGram / exteraGram.
+"""Ayu Music 1.4: native music library for AyuGram / exteraGram.
 
 Single-file source plugin. No external servers, tokens, packages or message sends.
 Music provider and document-to-MessageObject conversion follow Telegram Android's
@@ -26,9 +26,9 @@ from extera_utils.classes import Base, java_subclass, joverride
 
 __id__ = "ayu_music"
 __name__ = "Ayu Music"
-__description__ = "Волны по треку, плейлисту и любимому, локальная медиатека, импорт из чатов, кэш и оформление своими цветами. Штатный плеер Telegram."
+__description__ = "Музыкальные волны, любимое и плейлисты, импорт из чатов, все локальные треки в кэше и автоочистка временного аудио. Штатный плеер Telegram."
 __author__ = "@Demon_In_Moscow"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=13.1.1"
 __sdk_version__ = ">=1.4.4.3"
@@ -247,13 +247,14 @@ class Collection:
             raise ValueError("Неподдерживаемый формат коллекции")
         self.data = raw or {"schema": 2}
         defaults = {"tracks": {}, "liked": [], "playlists": {}, "seeds": [], "genres": [],
-                    "scores": {}, "recent": [], "blocked": [], "hidden_short": True, "cache": [], "subgenres": []}
+                    "scores": {}, "recent": [], "blocked": [], "hidden_short": True, "cache": [], "subgenres": [],
+                    "temporary": [], "cache_policy": 0}
         for key, default in defaults.items():
             self.data.setdefault(key, default)
         for key in ("tracks", "playlists", "scores"):
             if not isinstance(self.data[key], dict):
                 raise ValueError("Повреждены данные: " + key)
-        for key in ("liked", "seeds", "genres", "recent", "blocked", "cache", "subgenres"):
+        for key in ("liked", "seeds", "genres", "recent", "blocked", "cache", "subgenres", "temporary"):
             if not isinstance(self.data[key], list):
                 raise ValueError("Повреждены данные: " + key)
         if len(self.data["tracks"]) > 10000:
@@ -272,6 +273,7 @@ class Collection:
         catalog=subgenre_catalog()
         self.data["subgenres"] = [key for key in self.data["subgenres"] if isinstance(key,str) and key in catalog]
         self.data["cache"] = list(dict.fromkeys(str(k) for k in self.data["cache"] if str(k) in self.data["tracks"]))
+        self.data["temporary"] = list(dict.fromkeys(str(k) for k in self.data["temporary"] if str(k) in self.data["tracks"]))
 
     def dump(self):
         return json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
@@ -283,7 +285,8 @@ class Collection:
             "duration": int(track.get("duration", 0)), "query": str(track.get("query", "")),
             "document": document or previous.get("document", ""), "fetched": float(track.get("fetched", time.time())),
             "source": track.get("source") or previous.get("source"),
-            "genre": track.get("genre") or previous.get("genre","")}
+            "genre": track.get("genre") or previous.get("genre",""),
+            "local_path": str(track.get("local_path") or previous.get("local_path", ""))}
 
     def like(self, key):
         key = str(key)
@@ -593,6 +596,7 @@ class MusicAccount:
         self.import_status = ""
         self.warming=set()
         self.warm_failed={}
+        run_on_ui_thread(self.downloads.recover,1500)
 
     def valid(self):
         return self.plugin.active and self.user_id > 0 and int(UserConfig.getInstance(self.account).getClientUserId()) == self.user_id
@@ -619,6 +623,7 @@ class MusicAccount:
         tracks = self.collection.data["tracks"]
         keep = set(self.collection.data["liked"])
         keep.update(self.collection.data["cache"])
+        keep.update(self.collection.data["temporary"])
         for playlist in self.collection.data["playlists"].values():
             keep.update(playlist["ids"])
         keep.update(item.get("id") for item in self.collection.data["recent"][-120:])
@@ -719,6 +724,8 @@ class MusicAccount:
             track["fetched"] = float(stored.get("fetched", 0))
             track["source"] = stored.get("source")
             track["genre"] = stored.get("genre","")
+            track["local_path"] = str(stored.get("local_path", ""))
+            track["message"].messageOwner.attachPath = track["local_path"]
             return track
         except Exception:
             if stored.get("source"):
@@ -1355,6 +1362,7 @@ class MusicAccount:
         result=self.make_track(playback.getDocument(),audio,str(audio.performer or ""))
         self.owned.pop(owned_message_key(result["message"]),None)
         result["message"]=playback
+        result["local_path"]=str(field(playback.messageOwner,"attachPath") or field(document,"localPath") or "")
         source={"dialog":did,"message":mid,"user":self.user_id}
         peer=field(raw,"peer_id")
         channel=int(field(peer,"channel_id") or 0)
@@ -1650,6 +1658,40 @@ class WaveSkipHook(MethodHook):
             self.plugin.record_error("wave next")
 
 
+class PlaybackCacheHook(MethodHook):
+    """Observe native transitions without replacing or delaying audio playback."""
+    def __init__(self,plugin,kind):
+        self.plugin,self.kind=plugin,kind
+
+    def before_hooked_method(self,param):
+        if not self.plugin.active:return
+        try:
+            current=MediaController.getInstance().getPlayingMessageObject()
+            param.setObjectExtra("ayu_music_cache_previous",current)
+            for owner in list(self.plugin.accounts.values()):
+                if not owner.valid():continue
+                owner.downloads.remember_message(current)
+                if self.kind=="play" and len(param.args):owner.downloads.started(param.args[0])
+        except Exception:self.plugin.record_error("observe audio cache start")
+
+    def after_hooked_method(self,param):
+        if not self.plugin.active:return
+        try:
+            media=MediaController.getInstance()
+            current=media.getPlayingMessageObject()
+            previous=param.getObjectExtra("ayu_music_cache_previous")
+            if self.kind=="next" and len(param.args) and bool(param.args[0]) and current is not None and same_message(current,previous):
+                # Telegram retains the last MessageObject after releasing the
+                # player at the end of a finite playlist. Ordinary pause and
+                # repeat-one must never enter this path.
+                if media.isMessagePaused() and not media.isDownloadingCurrentMessage() and field(media,"audioPlayer") is None and field(media,"videoPlayer") is None:
+                    owner=self.plugin.accounts.get(int(current.currentAccount))
+                    if owner is not None:owner.downloads.ended(current)
+            for owner in list(self.plugin.accounts.values()):
+                if owner.valid():owner.downloads.playback_changed()
+        except Exception:self.plugin.record_error("observe audio cache transition")
+
+
 # Chaquopy proxy classes cannot be subclassed through an SDK proxy wrapper.
 # Use a fresh direct proxy base, as with SearchEditor in the working prototype.
 class PlaybackObserver(dynamic_proxy(jclass("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate"))):
@@ -1667,6 +1709,7 @@ class PlaybackObserver(dynamic_proxy(jclass("org.telegram.messenger.Notification
                     if notification_id in self.plugin.cache_events:
                         owner.downloads.event(notification_id,args)
                     else:
+                        owner.downloads.playback_changed()
                         owner.observe()
                 except Exception:
                     self.plugin.record_error("playback signal")
@@ -2227,6 +2270,247 @@ class CacheDownloads:
         self.statuses={}
         self.memo={}
         self.closed=False
+        self.temporary={}
+        self.retired={}
+        self.current_key=None
+        self.next_key=None
+        self.finished=None
+        self.clean_scheduled=False
+        self.clean_attempts={}
+
+    def native_downloads(self,account=None):
+        """Explicit Telegram downloads, including songs saved outside this UI."""
+        account=self.owner.account if account is None else int(account)
+        try:
+            controller=jclass("org.telegram.messenger.DownloadController").getInstance(account)
+            result=[]
+            for name in ("downloadingFiles","recentDownloadingFiles"):
+                result.extend(java_items(field(controller,name)))
+            return [m for m in result if int(m.currentAccount)==account and m.isMusic()]
+        except Exception:return []
+
+    def pinned(self,track):
+        key=str(track["id"])
+        # Telegram media directories can be shared by accounts. A saved copy in
+        # another account must not be removed by this account's player.
+        owners=list(self.owner.plugin.accounts.values())
+        accounts={self.owner.account}
+        for owner in owners:
+            accounts.add(owner.account)
+            if key in owner.collection.data["cache"]:return True
+        loaded={owner.user_id for owner in owners}
+        for account in range(int(field(UserConfig,"MAX_ACCOUNT_COUNT") or 4)):
+            try:user=int(UserConfig.getInstance(account).getClientUserId())
+            except Exception:continue
+            if user<=0:continue
+            accounts.add(account)
+            if user in loaded:continue
+            raw=self.owner.plugin.get_setting("collection_"+str(user),None)
+            if raw:
+                try:
+                    data=json.loads(raw) if isinstance(raw,str) else raw
+                    if key in data.get("cache",[]):return True
+                except Exception:return True
+        for account in accounts:
+            for message in self.native_downloads(account):
+                document=message.getDocument()
+                if document is not None and str(document.id)==key:return True
+        return False
+
+    def watch(self,track):
+        if track is None or track.get("message") is None:return
+        key=str(track["id"])
+        self.temporary[key]=track
+        ids=self.owner.collection.data["temporary"]
+        if key not in ids and not self.pinned(track):
+            self.owner.keep(track)
+            ids.append(key)
+            self.owner.save()
+
+    def remember_message(self,message):
+        self.watch(self.owner.owned_track(message))
+
+    def upcoming(self,current):
+        if self.owner.owned_track(current) is None or message_token(current)==self.finished:return None
+        media=MediaController.getInstance()
+        try:
+            queue=field(media,"shuffledPlaylist") if SharedConfig.shuffleMusic else media.getPlaylist()
+            position=int(field(media,"currentPlaylistNum"))
+            if queue is None or queue.size()<2 or position<0 or position>=queue.size():return None
+            if not same_message(queue.get(position),current):return None
+            index=(position+(1 if SharedConfig.playOrderReversed else -1))%queue.size()
+            return self.owner.owned_track(queue.get(index))
+        except Exception:return None
+
+    def playback_changed(self):
+        if self.closed or not self.owner.valid():return
+        current=MediaController.getInstance().getPlayingMessageObject()
+        track=self.owner.owned_track(current)
+        if track is not None and message_token(current)==self.finished:track=None
+        upcoming=self.upcoming(current)
+        key=str(track["id"]) if track else None
+        next_key=str(upcoming["id"]) if upcoming else None
+        changed=(key,next_key)!=(self.current_key,self.next_key)
+        self.current_key,self.next_key=key,next_key
+        self.watch(track)
+        self.watch(upcoming)
+        if changed:self.schedule_cleanup()
+
+    def started(self,message):
+        # Repeat-one and resume protect the current file just like a fresh play.
+        if self.owner.owned_track(message) is not None:self.finished=None
+
+    def ended(self,message):
+        if self.owner.owned_track(message) is None:return
+        self.watch(self.owner.owned_track(message))
+        self.finished=message_token(message)
+        self.playback_changed()
+        self.schedule_cleanup()
+
+    def recover(self):
+        if self.closed or not self.owner.valid():return
+        data=self.owner.collection.data
+        keys=list(data["temporary"])
+        if data.get("cache_policy")!=1:
+            # Upgrade old listening history, without scanning unrelated files or
+            # treating an imported but never played chat playlist as temporary.
+            keys.extend(item.get("id") for item in data["recent"] if isinstance(item,dict))
+            keys.extend(key for key,item in data["tracks"].items() if not item.get("source"))
+            data["cache_policy"]=1
+            self.owner.save()
+        keys=list(dict.fromkeys(str(key) for key in keys if key is not None))
+        def batch():
+            if self.closed or not self.owner.valid():return
+            for key in keys[:20]:self.watch(self.owner.materialize(key))
+            del keys[:20]
+            if keys:run_on_ui_thread(batch,100)
+            self.playback_changed()
+            self.schedule_cleanup()
+        batch()
+
+    def schedule_cleanup(self,delay=500):
+        if self.closed or self.clean_scheduled:return
+        self.clean_scheduled=True
+        run_on_ui_thread(self.cleanup,delay)
+
+    def cache_paths(self,track):
+        message=track.get("message")
+        if message is None:return []
+        document=message.getDocument()
+        if document is None:return []
+        result=[]
+        for resolve in (lambda:self.loader.getPathToAttach(document,True),
+                        lambda:self.loader.getPathToMessage(message.messageOwner)):
+            try:
+                file=resolve()
+                if file is not None:result.append(file)
+            except Exception:pass
+        return result
+
+    def managed_path(self,file,document):
+        """Only Telegram's media files; never user originals or public exports."""
+        try:
+            path=str(file.getCanonicalPath())
+            local=str(field(document,"localPath") or "")
+            if local and path==str(jclass("java.io.File")(local).getCanonicalPath()):return False
+            try:
+                if self.loader.getFileDatabase().isLocallyCreated(path):return False
+            except Exception:pass
+            for name in ("MEDIA_DIR_CACHE","MEDIA_DIR_AUDIO","MEDIA_DIR_DOCUMENT"):
+                root=FileLoader.getDirectory(getattr(FileLoader,name))
+                if root is not None and path.startswith(str(root.getCanonicalPath()).rstrip("/")+"/"):return True
+        except Exception:pass
+        return False
+
+    def in_use(self,track):
+        current=MediaController.getInstance().getPlayingMessageObject()
+        if current is None:return False
+        document=current.getDocument()
+        if document is None or str(document.id)!=str(track["id"]):return False
+        # A paused song remains protected. Only the native end callback can mark
+        # a retained, paused final MessageObject as finished.
+        return not (int(current.currentAccount)==self.owner.account and message_token(current)==self.finished)
+
+    def forget_temporary(self,key):
+        track=self.temporary.pop(key,None)
+        if track is not None:
+            self.retired[key]=track
+            if len(self.retired)>160:self.retired.pop(next(iter(self.retired)),None)
+        self.clean_attempts.pop(key,None)
+        ids=self.owner.collection.data["temporary"]
+        if key in ids:
+            ids.remove(key)
+            self.owner.save()
+
+    def cleanup(self):
+        self.clean_scheduled=False
+        if self.closed or not self.owner.valid():return
+        retry=False
+        for index,(key,track) in enumerate(list(self.temporary.items())):
+            if index>=20:
+                retry=True
+                break
+            if self.pinned(track):
+                self.forget_temporary(key)
+                continue
+            if self.in_use(track) or key==self.next_key:continue
+            try:
+                document=track["message"].getDocument()
+                name=str(FileLoader.getAttachFileName(document))
+                if self.loader.isLoadingFile(name):
+                    # A skipped streamed track can still have an active writer.
+                    # Cancel that document, then unlink on a later UI turn.
+                    self.loader.cancelLoadFile(document)
+                    self.clean_attempts[key]=self.clean_attempts.get(key,0)+1
+                    retry=retry or self.clean_attempts[key]<5
+                    continue
+                paths=self.cache_paths(track)
+                dc=int(field(document,"dc_id") or 0)
+                if dc and re.fullmatch(r"-?\d+",key):
+                    root=FileLoader.getDirectory(FileLoader.MEDIA_DIR_CACHE)
+                    for suffix in (".temp","_64.pt","_64.iv","_64.preload"):
+                        paths.append(jclass("java.io.File")(root,str(dc)+"_"+key+suffix))
+                failed=False
+                for file in paths:
+                    if not self.managed_path(file,document) or not file.exists():continue
+                    # Check again at unlink time: an explicit save or fast replay
+                    # must win over any older scheduled cleanup.
+                    if self.pinned(track) or self.in_use(track) or key==self.next_key:
+                        failed=True
+                        break
+                    if not file.delete() and file.exists():failed=True
+                self.memo.pop(key,None)
+                self.statuses.pop(key,None)
+                self.bind_local_file(track)
+                if not failed:self.forget_temporary(key)
+                else:
+                    self.clean_attempts[key]=self.clean_attempts.get(key,0)+1
+                    retry=retry or self.clean_attempts[key]<5
+            except Exception:
+                self.owner.plugin.record_error("clean temporary audio")
+        if retry:self.schedule_cleanup(1000)
+        self.owner.plugin.update_screens(self.owner)
+
+    def available_ids(self):
+        """Project actual local files, never turn this list into retention pins."""
+        for message in self.native_downloads():
+            document=message.getDocument()
+            if document is None:continue
+            key=str(document.id)
+            if key not in self.owner.runtime:
+                track=self.owner.track_from_message(message)
+                if track:self.owner.keep(track)
+        data=self.owner.collection.data
+        keys=list(reversed(data["cache"]))
+        seen=set(keys)
+        known=list(dict.fromkeys(list(data["tracks"])+list(self.owner.runtime)))
+        for key in reversed(known):
+            if key in seen:continue
+            track=self.owner.materialize(key)
+            if track is not None and self.local_file(track) is not None:
+                keys.append(key)
+                seen.add(key)
+        return keys
 
     def cached_file(self,track):
         message=track.get("message")
@@ -2235,7 +2519,7 @@ class CacheDownloads:
             document=message.getDocument()
             if document is None:return None
             expected=int(field(document,"size") or 0)
-            for file in (self.loader.getPathToAttach(document,True),self.loader.getPathToMessage(message.messageOwner)):
+            for file in self.cache_paths(track):
                 if file is not None and file.exists() and int(file.length())>0 and (expected<=0 or int(file.length())>=expected):return file
         except Exception:pass
         return None
@@ -2246,11 +2530,11 @@ class CacheDownloads:
         message=track.get("message")
         if message is None:return None
         try:
-            path=str(field(message.messageOwner,"attachPath") or "")
-            if not path:return None
-            file=jclass("java.io.File")(path)
             expected=int(field(message.getDocument(),"size") or 0)
-            if file.exists() and int(file.length())>0 and (expected<=0 or int(file.length())>=expected):return file
+            for path in (field(message.messageOwner,"attachPath"),track.get("local_path"),field(message.getDocument(),"localPath")):
+                if not path:continue
+                file=jclass("java.io.File")(str(path))
+                if file.exists() and int(file.length())>0 and (expected<=0 or int(file.length())>=expected):return file
         except Exception:pass
         return None
 
@@ -2280,7 +2564,7 @@ class CacheDownloads:
         key=str(track["id"])
         cached=self.memo.get(key)
         if cached and time.monotonic()-cached[0]<1.2:return cached[1]
-        if self.cached_file(track) is not None:
+        if self.local_file(track) is not None:
             value=("ready",100)
         elif key in self.statuses:
             value=self.statuses[key]
@@ -2375,8 +2659,20 @@ class CacheDownloads:
     def event(self,notification_id,args):
         if self.closed or not args:return
         name=str(args[0])
+        if notification_id in (NotificationCenter.fileLoaded,NotificationCenter.fileLoadFailed):
+            # Streaming/prefetch is not in the explicit-download queue. A late
+            # completion after skipping must still be cleaned up.
+            for key,temporary in list({**self.retired,**self.temporary}.items()):
+                if str(FileLoader.getAttachFileName(temporary["message"].getDocument()))==name:
+                    self.watch(temporary)
+                    self.memo.pop(key,None)
+                    self.schedule_cleanup()
         track=self.active.get(name)
-        if track is None:return
+        if track is None:
+            if notification_id in (NotificationCenter.fileLoaded,NotificationCenter.fileLoadFailed):
+                self.memo.clear()
+                self.owner.plugin.update_screens(self.owner)
+            return
         key=str(track["id"])
         if notification_id==NotificationCenter.fileLoadProgressChanged:
             try:
@@ -2397,6 +2693,8 @@ class CacheDownloads:
     def dispose(self):
         self.closed=True
         self.pending.clear()
+        self.temporary.clear()
+        self.retired.clear()
         # FileLoader owns already-started downloads. Do not interrupt Telegram's
         # player or another screen using the same file when this plugin unloads.
         self.active.clear()
@@ -2529,7 +2827,9 @@ def import_selection(context,fragment):
         if values is not None:
             try:messages.extend(java_items(values))
             except Exception:pass
-    if not messages and context.get("message") is not None:messages.append(context["message"])
+    if not messages:
+        message=context.get("message")
+        if message is not None:messages.append(message)
     result=[]
     seen=set()
     for message in messages:
@@ -3679,8 +3979,8 @@ class MusicScreen(Base):
             if self.owner.import_job and not self.owner.import_job.closed:
                 self.action_row("Остановить импорт",self.owner.import_job.cancel)
         if self.favorite_mode=="cache":
-            self.padded_text("Кэш Telegram доступен без интернета. Очистка кэша в клиенте удалит скачанные файлы.",12,True)
-            ids=list(reversed(data["cache"]))
+            self.padded_text("Здесь все найденные файлы треков на устройстве. «Скачать в кэш» сохраняет песню; временные файлы прослушивания удаляются после окончания или переключения. Лайки и плейлисты не сохраняют аудио.",12,True)
+            ids=self.owner.downloads.available_ids()
             tracks=self.saved_tracks(ids[:self.list_limit])
             ready=[t for t in tracks if self.owner.downloads.state(t)[0]=="ready"]
             if ready:self.primary_action("▶  Слушать скачанное",lambda:self.play_collection(ids,only_cached=True))
@@ -3933,7 +4233,8 @@ class MusicScreen(Base):
 
     def track_actions(self,track,allow_playlist_remove=True):
         state,percent=self.owner.downloads.state(track)
-        cache_action="✓ В кэше" if state=="ready" else "↓ Загрузка %d%%"%percent if state in ("queued","loading") else "Скачать в кэш"
+        saved=self.owner.downloads.pinned(track)
+        cache_action="✓ Сохранено в кэш" if saved and state=="ready" else "Сохранить в кэш" if state=="ready" else "↓ Загрузка %d%%"%percent if state in ("queued","loading") else "Скачать в кэш"
         options=["Добавить в плейлист","Убрать из любимого" if track["id"] in self.owner.collection.data["liked"] else "В любимое",cache_action,"Не предлагать в волне","Волна по треку"]
         if allow_playlist_remove and self.page=="playlist":options.append("Убрать из этого плейлиста")
         def chosen(dialog,index):
@@ -4009,7 +4310,7 @@ class MusicScreen(Base):
         state,percent=self.owner.downloads.state(track)
         if state=="ready":
             self.owner.downloads.enqueue([track])
-            self.notify("Песня уже в кэше Telegram")
+            self.notify("Песня сохранена в кэш")
         elif state in ("queued","loading"):
             self.owner.downloads.enqueue([track])
             self.notify("Песня уже загружается")
@@ -4456,6 +4757,9 @@ class AyuMusicPlugin(BasePlugin):
         media = find_class("org.telegram.messenger.MediaController")
         self.wave_available = False
         if media is not None:
+            self.hook_all_methods(media,"playMessage",PlaybackCacheHook(self,"play"))
+            self.hook_all_methods(media,"cleanupPlayer",PlaybackCacheHook(self,"cleanup"))
+            self.hook_all_methods(media,"playNextMessageWithoutOrder",PlaybackCacheHook(self,"next"))
             hooks = self.hook_all_methods(media,"playNextMessageWithoutOrder",WaveSkipHook(self))
             self.wave_available = bool(hooks)
             self.hook_all_methods(media,"playPreviousMessage",WaveSkipHook(self,True))
@@ -4580,7 +4884,7 @@ class AyuMusicPlugin(BasePlugin):
     def show_diagnostics(self):
         context=self.current_context()
         if context is None:return
-        text="Ayu Music 1.3.0\nАвтор: @Demon_In_Moscow\nAyuGram 20261104 / exteraGram 13.1.1\n"
+        text="Ayu Music 1.4.0\nАвтор: @Demon_In_Moscow\nAyuGram 20261104 / exteraGram 13.1.1\n"
         text+="Кнопок: %d · обработчик волны: %s\n"%(len(self.header_buttons),"готов" if self.wave_available else "недоступен")
         owner=self.current_owner()
         if owner:
@@ -4591,7 +4895,7 @@ class AyuMusicPlugin(BasePlugin):
             if owner.wave_seed:text+="Исходный трек: "+owner.wave_seed["track"]["title"]+" — "+owner.wave_seed["track"]["artist"]+"\nНаправление: "+owner.wave_seed["direction"]+"\n"
             if owner.wave_collection:text+="Коллекция: "+owner.wave_collection["name"]+" · треков: %d\n"%owner.wave_collection["profile"]["count"]
             text+=owner.wave_status+"\n"
-            text+="Кэш: %d · загрузок: %d\n"%(len(owner.collection.data["cache"]),len(owner.downloads.active))
+            text+="Закреплено в кэше: %d · загрузок: %d\n"%(len(owner.collection.data["cache"]),len(owner.downloads.active))
             if owner.import_status:text+=owner.import_status+"\n"
         text+="\n"+(self.last_error or "Ошибок плагина пока не записано.")
         AlertDialogBuilder(context).set_title("Диагностика Ayu Music").set_message(text).set_positive_button("Закрыть").set_neutral_button("Скопировать",lambda dialog,which:copy_to_clipboard(text)).show()
@@ -4629,6 +4933,7 @@ class AyuMusicPlugin(BasePlugin):
             owner.collection=restored
             owner.runtime.clear();owner.owned.clear();owner.local_queue=[]
             owner.downloads=CacheDownloads(owner)
+            run_on_ui_thread(owner.downloads.recover,1500)
             owner.save(immediate=True)
             self.update_screens(owner)
         message="В копии: %d любимых песен и %d плейлистов. Заменить текущую коллекцию плагина?"%(len(restored.data["liked"]),len(restored.data["playlists"]))
@@ -4718,7 +5023,7 @@ class AyuMusicPlugin(BasePlugin):
             self.show_diagnostics()
 
     def create_settings(self):
-        return [Header(text="Ayu Music · 1.3.0"),
+        return [Header(text="Ayu Music · 1.3.1"),
             Text(text="Открыть музыку",icon="msg_filled_data_music",on_click=lambda view:self.open_music()),
             Text(text="Облик, цвета и шрифты",subtext="Общая палитра, цвета блоков и жанров, 13 начертаний",icon="msg_theme",on_click=lambda view:self.open_music(page="appearance")),
             Text(text="Диагностика",icon="msg_info",on_click=lambda view:self.show_diagnostics()),
